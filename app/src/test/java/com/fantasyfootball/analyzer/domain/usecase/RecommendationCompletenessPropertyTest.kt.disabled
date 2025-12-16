@@ -1,0 +1,220 @@
+package com.fantasyfootball.analyzer.domain.usecase
+
+import com.fantasyfootball.analyzer.data.local.entity.Player
+import com.fantasyfootball.analyzer.data.local.entity.PlayerStats
+import com.fantasyfootball.analyzer.data.remote.NetworkResult
+import com.fantasyfootball.analyzer.domain.repository.PlayerRepository
+import com.fantasyfootball.analyzer.domain.model.MatchupRating
+import com.fantasyfootball.analyzer.domain.model.InjuryImpact
+import io.kotest.core.spec.style.StringSpec
+import io.kotest.matchers.shouldBe
+import io.kotest.matchers.shouldNotBe
+import io.kotest.matchers.collections.shouldHaveSize
+import io.kotest.matchers.doubles.shouldBeGreaterThanOrEqual
+import io.kotest.matchers.ints.shouldBeGreaterThan
+import io.kotest.matchers.string.shouldNotBeEmpty
+import io.kotest.property.Arb
+import io.kotest.property.arbitrary.*
+import io.kotest.property.checkAll
+import io.mockk.coEvery
+import io.mockk.mockk
+import kotlinx.coroutines.runBlocking
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
+import java.util.*
+
+/**
+ * **Feature: fantasy-football-analyzer, Property 7: Recommendation completeness**
+ * **Validates: Requirements 4.1, 4.2, 4.3, 4.4**
+ * 
+ * Property test verifying that for any roster of players, when weekly recommendations are requested, 
+ * the system should analyze all players, rank them based on historical matchup performance, 
+ * show projected points, and properly handle tie-breaking with consistency metrics.
+ */
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [28])
+class RecommendationCompletenessPropertyTest : StringSpec({
+
+    "Property 7: Recommendation completeness - For any roster of players, when weekly recommendations are requested, the system should analyze all players, rank them based on historical performance, show projected points, and handle tie-breaking with consistency" {
+        checkAll(100, rosterPlayersGenerator()) { players ->
+            runBlocking {
+                // Arrange
+                val mockRepository = mockk<PlayerRepository>()
+                val matchupAnalyzer = MatchupAnalyzerImpl(mockRepository)
+                
+                // Mock repository responses for each player
+                players.forEach { player ->
+                    val seasonStats = generateVariedSeasonStats(player.playerId, player.position)
+                    coEvery { mockRepository.getPlayer(player.playerId, any()) } returns NetworkResult.Success(player)
+                    coEvery { mockRepository.getPlayerStats(player.playerId, 2024, any()) } returns NetworkResult.Success(seasonStats)
+                }
+                
+                // Act
+                val result = matchupAnalyzer.generateWeeklyRecommendations(players.map { it.playerId })
+                
+                // Assert
+                result shouldBe NetworkResult.Success::class
+                if (result is NetworkResult.Success) {
+                    val recommendations = result.data
+                    
+                    // Requirement 4.1: Analyze all rostered players
+                    recommendations shouldHaveSize players.size
+                    
+                    // Verify each player has a recommendation
+                    val recommendedPlayerIds = recommendations.map { it.player.playerId }.toSet()
+                    val inputPlayerIds = players.map { it.playerId }.toSet()
+                    recommendedPlayerIds shouldBe inputPlayerIds
+                    
+                    recommendations.forEach { recommendation ->
+                        // Requirement 4.3: Show projected fantasy points
+                        recommendation.projectedPoints shouldBeGreaterThanOrEqual 0.0
+                        
+                        // Verify all required fields are populated
+                        recommendation.player shouldNotBe null
+                        recommendation.matchupRating shouldNotBe null
+                        recommendation.confidenceLevel shouldBeGreaterThanOrEqual 0.0
+                        recommendation.reasoning.shouldNotBeEmpty()
+                        recommendation.consistencyScore shouldBeGreaterThanOrEqual 0.0
+                        recommendation.injuryImpact shouldNotBe null
+                        recommendation.rank shouldBeGreaterThan 0
+                    }
+                    
+                    // Requirement 4.2: Rank players based on historical performance (projected points)
+                    val sortedByProjectedPoints = recommendations.sortedByDescending { it.projectedPoints }
+                    val sortedByRank = recommendations.sortedBy { it.rank }
+                    
+                    // Verify ranking is primarily based on projected points
+                    sortedByProjectedPoints.forEachIndexed { index, recommendation ->
+                        val rankBasedRecommendation = sortedByRank[index]
+                        
+                        // For players with significantly different projected points, 
+                        // the higher projected points should have better rank
+                        if (index < sortedByProjectedPoints.size - 1) {
+                            val current = sortedByProjectedPoints[index]
+                            val next = sortedByProjectedPoints[index + 1]
+                            val pointsDifference = current.projectedPoints - next.projectedPoints
+                            
+                            if (pointsDifference > 2.0) { // Significant difference
+                                current.rank shouldBe kotlin.comparisons.minOf(current.rank, next.rank)
+                            }
+                        }
+                    }
+                    
+                    // Requirement 4.4: Tie-breaking with consistency metrics
+                    // Find players with similar projected points (within 1.0 point)
+                    val groupedBySimilarPoints = recommendations.groupBy { 
+                        (it.projectedPoints / 1.0).toInt() 
+                    }.values.filter { it.size > 1 }
+                    
+                    groupedBySimilarPoints.forEach { similarPointsGroup ->
+                        if (similarPointsGroup.size > 1) {
+                            // Within groups of similar projected points, 
+                            // higher consistency should lead to better ranking
+                            val sortedByConsistency = similarPointsGroup.sortedByDescending { it.consistencyScore }
+                            val sortedByRankInGroup = similarPointsGroup.sortedBy { it.rank }
+                            
+                            // Verify that among players with similar points, 
+                            // more consistent players are ranked higher
+                            for (i in 0 until sortedByConsistency.size - 1) {
+                                val moreConsistent = sortedByConsistency[i]
+                                val lessConsistent = sortedByConsistency[i + 1]
+                                
+                                val consistencyDifference = moreConsistent.consistencyScore - lessConsistent.consistencyScore
+                                if (consistencyDifference > 0.1) { // Significant consistency difference
+                                    moreConsistent.rank shouldBe kotlin.comparisons.minOf(moreConsistent.rank, lessConsistent.rank)
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Verify ranks are sequential and unique
+                    val ranks = recommendations.map { it.rank }.sorted()
+                    ranks shouldBe (1..recommendations.size).toList()
+                    
+                    // Verify matchup ratings are appropriate for projected points
+                    recommendations.forEach { recommendation ->
+                        val expectedRating = when {
+                            recommendation.projectedPoints >= 20.0 -> MatchupRating.EXCELLENT
+                            recommendation.projectedPoints >= 15.0 -> MatchupRating.GOOD
+                            recommendation.projectedPoints >= 10.0 -> MatchupRating.AVERAGE
+                            recommendation.projectedPoints >= 5.0 -> MatchupRating.POOR
+                            else -> MatchupRating.AVOID
+                        }
+                        recommendation.matchupRating shouldBe expectedRating
+                    }
+                    
+                    // Verify injury impact is correctly determined
+                    recommendations.forEach { recommendation ->
+                        val expectedImpact = when (recommendation.player.injuryStatus?.lowercase()) {
+                            null, "healthy", "" -> InjuryImpact.NONE
+                            "questionable", "probable" -> InjuryImpact.MINOR
+                            "doubtful" -> InjuryImpact.MODERATE
+                            "out", "injured reserve", "ir" -> InjuryImpact.OUT
+                            else -> InjuryImpact.MINOR
+                        }
+                        recommendation.injuryImpact shouldBe expectedImpact
+                    }
+                }
+            }
+        }
+    }
+})
+
+private fun rosterPlayersGenerator() = arbitrary { rs ->
+    val numPlayers = Arb.int(2, 8).next(rs) // Generate 2-8 players for realistic roster size
+    
+    val positions = listOf("QB", "RB", "WR", "TE", "K", "DEF")
+    val teams = listOf("DAL", "NYG", "PHI", "WAS", "GB", "MIN", "CHI", "DET", "SF", "LAR", "SEA", "ARI")
+    val injuryStatuses = listOf(null, "healthy", "", "questionable", "probable", "doubtful", "out")
+    
+    (1..numPlayers).map { index ->
+        val playerId = "player_${index}_${Arb.string(3..5).next(rs)}"
+        val injuryStatus = Arb.element(injuryStatuses).next(rs)
+        
+        Player(
+            playerId = playerId,
+            name = "Player $index",
+            position = Arb.element(positions).next(rs),
+            team = Arb.element(teams).next(rs),
+            injuryStatus = injuryStatus,
+            isActive = injuryStatus != "out" && injuryStatus != "injured reserve" && injuryStatus != "ir",
+            lastUpdated = System.currentTimeMillis()
+        )
+    }
+}
+
+private fun generateVariedSeasonStats(playerId: String, position: String): List<PlayerStats> {
+    // Generate stats that vary based on position to create realistic scenarios
+    val basePoints = when (position) {
+        "QB" -> 18.0
+        "RB" -> 12.0
+        "WR" -> 10.0
+        "TE" -> 8.0
+        "K" -> 7.0
+        "DEF" -> 6.0
+        else -> 10.0
+    }
+    
+    return (1..12).map { week ->
+        val calendar = Calendar.getInstance()
+        calendar.set(2024, Calendar.SEPTEMBER, week * 7)
+        
+        // Add some variance to create different consistency scores
+        val variance: Double = kotlin.random.Random.nextDouble(-5.0, 5.0)
+        val fantasyPoints = (basePoints + variance).coerceAtLeast(0.0)
+        
+        PlayerStats(
+            id = "${playerId}_2024_${week}",
+            playerId = playerId,
+            season = 2024,
+            week = week,
+            fantasyPoints = fantasyPoints,
+            rushingYards = if (position in listOf("RB", "QB")) kotlin.random.Random.nextInt(0, 151) else 0,
+            passingYards = if (position == "QB") kotlin.random.Random.nextInt(200, 351) else 0,
+            receivingYards = if (position in listOf("WR", "TE", "RB")) kotlin.random.Random.nextInt(0, 121) else 0,
+            touchdowns = kotlin.random.Random.nextInt(0, 4),
+            gameDate = calendar.timeInMillis
+        )
+    }
+}

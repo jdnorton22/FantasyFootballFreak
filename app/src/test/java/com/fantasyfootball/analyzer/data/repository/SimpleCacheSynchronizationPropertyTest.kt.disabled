@@ -1,0 +1,246 @@
+package com.fantasyfootball.analyzer.data.repository
+
+import androidx.room.Room
+import androidx.test.core.app.ApplicationProvider
+import com.fantasyfootball.analyzer.data.cache.CacheManager
+import com.fantasyfootball.analyzer.data.local.AppDatabase
+import com.fantasyfootball.analyzer.data.local.entity.Player
+import com.fantasyfootball.analyzer.data.local.entity.PlayerStats
+import org.junit.Test
+import io.kotest.matchers.shouldBe
+import io.kotest.matchers.shouldNotBe
+import io.kotest.matchers.comparables.shouldBeGreaterThan
+import io.kotest.property.Arb
+import io.kotest.property.arbitrary.*
+import io.kotest.property.checkAll
+import kotlinx.coroutines.runBlocking
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
+
+/**
+ * **Feature: fantasy-football-analyzer, Property 5: Cache synchronization**
+ * **Validates: Requirements 3.4**
+ * 
+ * Simplified property-based test ensuring cache synchronization maintains data consistency.
+ * This test focuses on the core cache synchronization logic without external API dependencies.
+ */
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [28])
+class SimpleCacheSynchronizationPropertyTest {
+    
+    @Test
+    fun `Cache synchronization preserves data consistency during updates`() {
+        checkAll(100, cacheUpdateScenarioGenerator()) { scenario ->
+            runBlocking {
+                // Setup in-memory database
+                val database = Room.inMemoryDatabaseBuilder(
+                    ApplicationProvider.getApplicationContext(),
+                    AppDatabase::class.java
+                ).allowMainThreadQueries().build()
+                
+                val playerDao = database.playerDao()
+                val cacheManager = CacheManager(playerDao)
+                
+                // Step 1: Store initial data in cache
+                cacheManager.cachePlayerData(scenario.initialPlayer)
+                cacheManager.cachePlayerStatsList(scenario.initialStats)
+                
+                // Verify initial state
+                val initialCachedPlayer = cacheManager.getCachedPlayer(scenario.initialPlayer.playerId)
+                initialCachedPlayer shouldNotBe null
+                initialCachedPlayer!!.name shouldBe scenario.initialPlayer.name
+                initialCachedPlayer.injuryStatus shouldBe scenario.initialPlayer.injuryStatus
+                
+                val initialCachedStats = cacheManager.getCachedPlayerStats(
+                    scenario.initialPlayer.playerId, 
+                    scenario.initialStats.first().season
+                )
+                initialCachedStats.size shouldBe scenario.initialStats.size
+                
+                // Step 2: Simulate synchronization by updating cache with new data
+                val updatedPlayer = scenario.initialPlayer.copy(
+                    injuryStatus = scenario.updatedInjuryStatus,
+                    isActive = scenario.updatedActiveStatus,
+                    lastUpdated = System.currentTimeMillis()
+                )
+                
+                val updatedStats = scenario.initialStats.map { stat ->
+                    stat.copy(fantasyPoints = stat.fantasyPoints + scenario.fantasyPointsIncrease)
+                }
+                
+                // Perform the synchronization update
+                cacheManager.cachePlayerData(updatedPlayer)
+                cacheManager.cachePlayerStatsList(updatedStats)
+                
+                // Step 3: Verify synchronization maintained data consistency
+                val syncedPlayer = cacheManager.getCachedPlayer(scenario.initialPlayer.playerId)
+                syncedPlayer shouldNotBe null
+                syncedPlayer!!.playerId shouldBe scenario.initialPlayer.playerId // Identity preserved
+                syncedPlayer.name shouldBe scenario.initialPlayer.name // Core data preserved
+                syncedPlayer.injuryStatus shouldBe scenario.updatedInjuryStatus // Updated data applied
+                syncedPlayer.isActive shouldBe scenario.updatedActiveStatus // Updated data applied
+                syncedPlayer.lastUpdated shouldBeGreaterThan initialCachedPlayer.lastUpdated // Timestamp updated
+                
+                val syncedStats = cacheManager.getCachedPlayerStats(
+                    scenario.initialPlayer.playerId, 
+                    scenario.initialStats.first().season
+                )
+                syncedStats.size shouldBe scenario.initialStats.size // Count preserved
+                syncedStats.first().playerId shouldBe scenario.initialPlayer.playerId // Identity preserved
+                syncedStats.first().fantasyPoints shouldBe (scenario.initialStats.first().fantasyPoints + scenario.fantasyPointsIncrease) // Updated data applied
+                
+                // Step 4: Verify cache freshness is updated
+                val isCacheFresh = cacheManager.isCacheFresh(scenario.initialPlayer.playerId)
+                isCacheFresh shouldBe true // Should be fresh after sync
+                
+                // Clean up
+                database.close()
+            }
+        }
+    }
+    
+    @Test
+    fun `Cache synchronization handles partial updates correctly`() {
+        checkAll(50, cacheUpdateScenarioGenerator()) { scenario ->
+            runBlocking {
+                // Setup in-memory database
+                val database = Room.inMemoryDatabaseBuilder(
+                    ApplicationProvider.getApplicationContext(),
+                    AppDatabase::class.java
+                ).allowMainThreadQueries().build()
+                
+                val playerDao = database.playerDao()
+                val cacheManager = CacheManager(playerDao)
+                
+                // Store initial data
+                cacheManager.cachePlayerData(scenario.initialPlayer)
+                cacheManager.cachePlayerStatsList(scenario.initialStats)
+                
+                // Simulate partial sync - only update player, not stats
+                val updatedPlayer = scenario.initialPlayer.copy(
+                    injuryStatus = scenario.updatedInjuryStatus,
+                    lastUpdated = System.currentTimeMillis()
+                )
+                
+                cacheManager.cachePlayerData(updatedPlayer)
+                // Note: Not updating stats to simulate partial sync
+                
+                // Verify player was updated
+                val syncedPlayer = cacheManager.getCachedPlayer(scenario.initialPlayer.playerId)
+                syncedPlayer shouldNotBe null
+                syncedPlayer!!.injuryStatus shouldBe scenario.updatedInjuryStatus
+                
+                // Verify stats remained unchanged (data integrity preserved)
+                val unchangedStats = cacheManager.getCachedPlayerStats(
+                    scenario.initialPlayer.playerId, 
+                    scenario.initialStats.first().season
+                )
+                unchangedStats.size shouldBe scenario.initialStats.size
+                unchangedStats.first().fantasyPoints shouldBe scenario.initialStats.first().fantasyPoints
+                
+                // Clean up
+                database.close()
+            }
+        }
+    }
+    
+    @Test
+    fun `Cache synchronization maintains referential integrity`() {
+        checkAll(50, cacheUpdateScenarioGenerator()) { scenario ->
+            runBlocking {
+                // Setup in-memory database
+                val database = Room.inMemoryDatabaseBuilder(
+                    ApplicationProvider.getApplicationContext(),
+                    AppDatabase::class.java
+                ).allowMainThreadQueries().build()
+                
+                val playerDao = database.playerDao()
+                val cacheManager = CacheManager(playerDao)
+                
+                // Store initial data
+                cacheManager.cachePlayerData(scenario.initialPlayer)
+                cacheManager.cachePlayerStatsList(scenario.initialStats)
+                
+                // Verify foreign key relationships are maintained
+                val allStats = playerDao.getAllPlayerStats(scenario.initialPlayer.playerId)
+                allStats.size shouldBe scenario.initialStats.size
+                allStats.forEach { stat ->
+                    stat.playerId shouldBe scenario.initialPlayer.playerId
+                }
+                
+                // Update player and verify relationships are preserved
+                val updatedPlayer = scenario.initialPlayer.copy(
+                    name = "Updated ${scenario.initialPlayer.name}",
+                    lastUpdated = System.currentTimeMillis()
+                )
+                
+                cacheManager.cachePlayerData(updatedPlayer)
+                
+                // Verify stats still reference the correct player
+                val statsAfterUpdate = playerDao.getAllPlayerStats(scenario.initialPlayer.playerId)
+                statsAfterUpdate.size shouldBe scenario.initialStats.size
+                statsAfterUpdate.forEach { stat ->
+                    stat.playerId shouldBe scenario.initialPlayer.playerId
+                }
+                
+                // Verify player update was applied
+                val updatedPlayerFromCache = cacheManager.getCachedPlayer(scenario.initialPlayer.playerId)
+                updatedPlayerFromCache shouldNotBe null
+                updatedPlayerFromCache!!.name shouldBe "Updated ${scenario.initialPlayer.name}"
+                
+                // Clean up
+                database.close()
+            }
+        }
+    }
+}
+
+// Data class for cache update scenarios
+private data class CacheUpdateScenario(
+    val initialPlayer: Player,
+    val initialStats: List<PlayerStats>,
+    val updatedInjuryStatus: String?,
+    val updatedActiveStatus: Boolean,
+    val fantasyPointsIncrease: Double
+)
+
+// Generator for cache update scenarios
+private fun cacheUpdateScenarioGenerator(): Arb<CacheUpdateScenario> = Arb.bind(
+    playerGenerator(),
+    Arb.list(playerStatsGenerator(), 1..3),
+    Arb.element(listOf("Healthy", "Questionable", "Doubtful", "Out", "IR")).orNull(),
+    Arb.boolean(),
+    Arb.double(-5.0..10.0)
+) { player, stats, updatedInjury, updatedActive, pointsIncrease ->
+    val consistentStats = stats.map { it.copy(playerId = player.playerId) }
+    CacheUpdateScenario(player, consistentStats, updatedInjury, updatedActive, pointsIncrease)
+}
+
+private fun playerGenerator(): Arb<Player> = Arb.bind(
+    Arb.string(5..15), // playerId
+    Arb.string(5..30), // name
+    Arb.element(listOf("QB", "RB", "WR", "TE", "K", "DEF")), // position
+    Arb.element(listOf("ARI", "ATL", "BAL", "BUF", "CAR", "CHI", "CIN", "CLE", "DAL", "DEN", "DET", "GB", "HOU", "IND", "JAX", "KC", "LV", "LAC", "LAR", "MIA", "MIN", "NE", "NO", "NYG", "NYJ", "PHI", "PIT", "SF", "SEA", "TB", "TEN", "WAS")), // team
+    Arb.element(listOf("Healthy", "Questionable", "Doubtful", "Out", "IR")).orNull(), // injuryStatus
+    Arb.boolean(), // isActive
+    Arb.long(System.currentTimeMillis() - 86400000L..System.currentTimeMillis()) // lastUpdated (within last 24 hours)
+) { playerId, name, position, team, injuryStatus, isActive, lastUpdated ->
+    Player(playerId, name, position, team, injuryStatus, isActive, lastUpdated)
+}
+
+private fun playerStatsGenerator(): Arb<PlayerStats> = Arb.bind(
+    Arb.string(5..25), // id
+    Arb.string(5..15), // playerId (will be overridden for consistency)
+    Arb.int(2021..2024), // season
+    Arb.int(1..18).orNull(), // week
+    Arb.double(0.0..40.0), // fantasyPoints
+    Arb.int(0..250), // rushingYards
+    Arb.int(0..400), // passingYards
+    Arb.int(0..150), // receivingYards
+    Arb.int(0..4), // touchdowns
+    Arb.long(System.currentTimeMillis() - 86400000L..System.currentTimeMillis()) // gameDate
+) { id, playerId, season, week, fantasyPoints, rushingYards, passingYards, receivingYards, touchdowns, gameDate ->
+    PlayerStats(id, playerId, season, week, fantasyPoints, rushingYards, passingYards, receivingYards, touchdowns, gameDate)
+}
+

@@ -1,0 +1,241 @@
+package com.fantasyfootball.analyzer.data.cache
+
+import androidx.room.Room
+import androidx.test.core.app.ApplicationProvider
+import com.fantasyfootball.analyzer.data.local.AppDatabase
+import com.fantasyfootball.analyzer.data.local.entity.Player
+import com.fantasyfootball.analyzer.data.local.entity.PlayerStats
+import com.fantasyfootball.analyzer.data.local.entity.MatchupData
+import io.kotest.matchers.shouldBe
+import io.kotest.matchers.comparables.shouldBeGreaterThan
+import io.kotest.matchers.comparables.shouldBeLessThan
+import io.kotest.matchers.longs.shouldBeLessThanOrEqual
+import io.kotest.property.Arb
+import io.kotest.property.arbitrary.*
+import io.kotest.property.checkAll
+import kotlinx.coroutines.runBlocking
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
+
+/**
+ * **Feature: fantasy-football-analyzer, Property 6: Cache storage management**
+ * **Validates: Requirements 3.5**
+ * 
+ * Property-based test ensuring that cache storage management correctly handles
+ * size limits and removes oldest entries when cache exceeds 100MB limit.
+ */
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [28])
+class CacheStorageManagementPropertyTest {
+    
+    @Test
+    fun `Cache size calculation is consistent`() = runBlocking {
+        val database = Room.inMemoryDatabaseBuilder(
+            ApplicationProvider.getApplicationContext(),
+            AppDatabase::class.java
+        ).allowMainThreadQueries().build()
+        
+        val cacheManager = CacheManager(database.playerDao())
+        
+        checkAll(50, Arb.list(playerGenerator(), 1..20)) { players ->
+                // Clear cache before test
+                cacheManager.clearAllCache()
+                
+                // Cache players
+                cacheManager.cachePlayersData(players)
+                
+                // Get cache size
+                val cacheSize = cacheManager.getCacheSize()
+                
+                // Cache size should be positive and reasonable
+                cacheSize shouldBeGreaterThan 0L
+                cacheSize shouldBeLessThan 1000000L // Should be less than 1MB for small datasets
+                
+                // Cache stats should be consistent
+                val stats = cacheManager.getCacheStats()
+                stats.playerCount shouldBe players.size
+                stats.totalSizeBytes shouldBe cacheSize
+            }
+        }
+        
+        database.close()
+    }
+    
+    @Test
+    fun `Cache freshness validation works correctly`() {
+        val database = Room.inMemoryDatabaseBuilder(
+            ApplicationProvider.getApplicationContext(),
+            AppDatabase::class.java
+        ).allowMainThreadQueries().build()
+        
+        val cacheManager = CacheManager(database.playerDao())
+        
+        checkAll(50, playerGenerator()) { player ->
+            runBlocking {
+                // Clear cache before test
+                cacheManager.clearAllCache()
+                
+                // Cache fresh player data
+                val freshPlayer = player.copy(lastUpdated = System.currentTimeMillis())
+                cacheManager.cachePlayerData(freshPlayer)
+                
+                // Fresh data should be valid
+                cacheManager.isCacheValid(freshPlayer.playerId) shouldBe true
+                cacheManager.isCacheFresh(freshPlayer.playerId) shouldBe true
+                
+                // Cache old player data
+                val oldPlayer = player.copy(
+                    playerId = player.playerId + "_old",
+                    lastUpdated = System.currentTimeMillis() - (25 * 60 * 60 * 1000L) // 25 hours ago
+                )
+                cacheManager.cachePlayerData(oldPlayer)
+                
+                // Old data should not be valid
+                cacheManager.isCacheValid(oldPlayer.playerId) shouldBe false
+                cacheManager.isCacheFresh(oldPlayer.playerId) shouldBe false
+                
+                // Cache age should be reasonable
+                val cacheAge = cacheManager.getCacheAge(freshPlayer.playerId)
+                cacheAge?.let { age ->
+                    age shouldBeLessThanOrEqual 1000L // Should be very recent (less than 1 second)
+                }
+            }
+        }
+        
+        database.close()
+    }
+    
+    @Test
+    fun `Expired cache cleanup removes old entries`() {
+        val database = Room.inMemoryDatabaseBuilder(
+            ApplicationProvider.getApplicationContext(),
+            AppDatabase::class.java
+        ).allowMainThreadQueries().build()
+        
+        val cacheManager = CacheManager(database.playerDao())
+        
+        checkAll(30, Arb.list(playerGenerator(), 5..15)) { players ->
+            runBlocking {
+                // Clear cache before test
+                cacheManager.clearAllCache()
+                
+                val currentTime = System.currentTimeMillis()
+                val expiredTime = currentTime - (25 * 60 * 60 * 1000L) // 25 hours ago
+                val freshTime = currentTime - (1 * 60 * 60 * 1000L) // 1 hour ago
+                
+                // Cache some expired players
+                val expiredPlayers = players.take(players.size / 2).mapIndexed { index, player ->
+                    player.copy(
+                        playerId = "${player.playerId}_expired_$index",
+                        lastUpdated = expiredTime
+                    )
+                }
+                
+                // Cache some fresh players
+                val freshPlayers = players.drop(players.size / 2).mapIndexed { index, player ->
+                    player.copy(
+                        playerId = "${player.playerId}_fresh_$index",
+                        lastUpdated = freshTime
+                    )
+                }
+                
+                // Cache all players
+                cacheManager.cachePlayersData(expiredPlayers + freshPlayers)
+                
+                // Get initial stats
+                val initialStats = cacheManager.getCacheStats()
+                initialStats.playerCount shouldBe players.size
+                initialStats.expiredCount shouldBe expiredPlayers.size
+                
+                // Clear expired cache
+                cacheManager.clearExpiredCache()
+                
+                // Get stats after cleanup
+                val afterCleanupStats = cacheManager.getCacheStats()
+                afterCleanupStats.playerCount shouldBe freshPlayers.size
+                afterCleanupStats.expiredCount shouldBe 0
+                
+                // Verify expired players are gone
+                expiredPlayers.forEach { expiredPlayer ->
+                    val retrieved = cacheManager.getCachedPlayer(expiredPlayer.playerId)
+                    retrieved shouldBe null
+                }
+                
+                // Verify fresh players remain
+                freshPlayers.forEach { freshPlayer ->
+                    val retrieved = cacheManager.getCachedPlayer(freshPlayer.playerId)
+                    retrieved shouldBe freshPlayer
+                }
+            }
+        }
+        
+        database.close()
+    }
+    
+    @Test
+    fun `Cache eviction maintains functionality under size pressure`() {
+        val database = Room.inMemoryDatabaseBuilder(
+            ApplicationProvider.getApplicationContext(),
+            AppDatabase::class.java
+        ).allowMainThreadQueries().build()
+        
+        val cacheManager = CacheManager(database.playerDao())
+        
+        checkAll(20, Arb.list(playerGenerator(), 10..30)) { players ->
+            runBlocking {
+                // Clear cache before test
+                cacheManager.clearAllCache()
+                
+                val currentTime = System.currentTimeMillis()
+                
+                // Create players with different timestamps to simulate aging
+                val playersWithTimestamps = players.mapIndexed { index, player ->
+                    player.copy(
+                        playerId = "${player.playerId}_$index",
+                        lastUpdated = currentTime - (index * 60 * 1000L) // Each player 1 minute older
+                    )
+                }
+                
+                // Cache all players
+                cacheManager.cachePlayersData(playersWithTimestamps)
+                
+                // Get initial cache size
+                val initialSize = cacheManager.getCacheSize()
+                val initialStats = cacheManager.getCacheStats()
+                
+                // Cache should be functional
+                initialStats.playerCount shouldBe players.size
+                initialSize shouldBeGreaterThan 0L
+                
+                // Most recent players should still be retrievable
+                val mostRecentPlayers = playersWithTimestamps.take(5)
+                mostRecentPlayers.forEach { player ->
+                    val retrieved = cacheManager.getCachedPlayer(player.playerId)
+                    retrieved shouldBe player
+                }
+                
+                // Cache stats should be consistent
+                val finalStats = cacheManager.getCacheStats()
+                finalStats.totalSizeBytes shouldBe cacheManager.getCacheSize()
+                finalStats.usagePercentage shouldBeLessThan 100.0
+            }
+        }
+        
+        database.close()
+    }
+}
+
+// Generators for property-based testing
+private fun playerGenerator(): Arb<Player> = Arb.bind(
+    Arb.string(5..15), // playerId
+    Arb.string(5..30), // name
+    Arb.element(listOf("QB", "RB", "WR", "TE", "K", "DEF")), // position
+    Arb.element(listOf("ARI", "ATL", "BAL", "BUF", "CAR", "CHI", "CIN", "CLE", "DAL", "DEN", "DET", "GB", "HOU", "IND", "JAX", "KC", "LV", "LAC", "LAR", "MIA", "MIN", "NE", "NO", "NYG", "NYJ", "PHI", "PIT", "SF", "SEA", "TB", "TEN", "WAS")), // team
+    Arb.element(listOf("Healthy", "Questionable", "Doubtful", "Out", "IR")).orNull(), // injuryStatus
+    Arb.boolean(), // isActive
+    Arb.long(System.currentTimeMillis() - 1000000L..System.currentTimeMillis()) // lastUpdated
+) { playerId, name, position, team, injuryStatus, isActive, lastUpdated ->
+    Player(playerId, name, position, team, injuryStatus, isActive, lastUpdated)
+}

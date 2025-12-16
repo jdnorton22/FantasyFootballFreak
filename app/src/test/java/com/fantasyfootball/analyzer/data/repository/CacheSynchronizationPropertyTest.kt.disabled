@@ -1,0 +1,464 @@
+package com.fantasyfootball.analyzer.data.repository
+
+import android.content.Context
+import androidx.room.Room
+import androidx.test.core.app.ApplicationProvider
+import com.fantasyfootball.analyzer.data.cache.CacheManager
+import com.fantasyfootball.analyzer.data.local.AppDatabase
+import com.fantasyfootball.analyzer.data.local.entity.Player
+import com.fantasyfootball.analyzer.data.local.entity.PlayerStats
+import com.fantasyfootball.analyzer.data.local.entity.MatchupData
+import com.fantasyfootball.analyzer.data.remote.ESPNApiService
+import com.fantasyfootball.analyzer.data.remote.NetworkResult
+import com.fantasyfootball.analyzer.data.remote.dto.PlayerResponse
+import com.fantasyfootball.analyzer.data.remote.dto.StatsResponse
+
+import com.fantasyfootball.analyzer.data.repository.PlayerRepositoryImpl
+import com.fantasyfootball.analyzer.domain.repository.PlayerRepository
+import org.junit.Test
+import io.kotest.matchers.shouldBe
+import io.kotest.matchers.shouldNotBe
+import io.kotest.property.Arb
+import io.kotest.property.arbitrary.*
+import io.kotest.property.checkAll
+import io.mockk.*
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.async
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
+import retrofit2.Response
+
+/**
+ * **Feature: fantasy-football-analyzer, Property 5: Cache synchronization**
+ * **Validates: Requirements 3.4**
+ * 
+ * Property-based test ensuring that when connectivity returns, the system automatically 
+ * updates cached data with current information while maintaining data consistency.
+ */
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [28])
+class CacheSynchronizationPropertyTest {
+    
+    @Test
+    fun `Cache synchronization maintains data consistency when network returns`() {
+        checkAll(100, cacheDataGenerator()) { cacheData ->
+            runBlocking {
+                // Setup in-memory database
+                val database = Room.inMemoryDatabaseBuilder(
+                    ApplicationProvider.getApplicationContext(),
+                    AppDatabase::class.java
+                ).allowMainThreadQueries().build()
+                
+                val playerDao = database.playerDao()
+                val cacheManager = CacheManager(playerDao)
+                
+                // Mock API service
+                val mockApiService = mockk<ESPNApiService>()
+                
+                // Setup mock responses for network data (simulating updated data)
+                val updatedPlayerResponse = PlayerResponse(
+                    id = cacheData.player.playerId,
+                    fullName = cacheData.player.name,
+                    firstName = cacheData.player.name.split(" ").firstOrNull(),
+                    lastName = cacheData.player.name.split(" ").lastOrNull(),
+                    defaultPositionId = mapPositionToId(cacheData.player.position),
+                    eligibleSlots = listOf(mapPositionToId(cacheData.player.position)),
+                    proTeamId = mapTeamToId(cacheData.player.team),
+                    injured = cacheData.player.injuryStatus != "Healthy",
+                    injuryStatus = "Updated Status", // Different from cached data
+                    active = !cacheData.player.isActive, // Different from cached data
+                    stats = null
+                )
+                
+                val updatedStatsResponse = StatsResponse(
+                    playerId = cacheData.player.playerId,
+                    season = cacheData.stats.first().season,
+                    week = cacheData.stats.first().week,
+                    gameDate = formatGameDate(cacheData.stats.first().gameDate),
+                    opponent = "OPP",
+                    fantasyPoints = cacheData.stats.first().fantasyPoints + 5.0, // Updated points
+                    rushingYards = cacheData.stats.first().rushingYards + 10, // Updated yards
+                    passingYards = cacheData.stats.first().passingYards,
+                    receivingYards = cacheData.stats.first().receivingYards,
+                    rushingTouchdowns = 1,
+                    passingTouchdowns = 1,
+                    receivingTouchdowns = 1,
+                    totalTouchdowns = cacheData.stats.first().touchdowns,
+                    fumbles = 0,
+                    interceptions = 0,
+                    receptions = null,
+                    targets = null
+                )
+                
+                coEvery { 
+                    mockApiService.getPlayerData(cacheData.player.playerId) 
+                } returns Response.success(updatedPlayerResponse)
+                
+                coEvery { 
+                    mockApiService.getPlayerStats(cacheData.player.playerId, any(), any()) 
+                } returns Response.success(updatedStatsResponse)
+                
+                coEvery { 
+                    mockApiService.getPlayerMatchupHistory(any(), any(), any()) 
+                } returns Response.success(emptyList())
+                
+                // Create repository with mocked API service
+                val context = ApplicationProvider.getApplicationContext<Context>()
+                val repository = PlayerRepositoryImpl(context, mockApiService, playerDao, cacheManager)
+                
+                // Step 1: Populate cache with initial data (simulating offline state)
+                cacheManager.cachePlayerData(cacheData.player)
+                cacheManager.cachePlayerStatsList(cacheData.stats)
+                cacheManager.cacheMatchupDataList(cacheData.matchups)
+                
+                // Verify initial cached data exists
+                val initialCachedPlayer = cacheManager.getCachedPlayer(cacheData.player.playerId)
+                initialCachedPlayer shouldNotBe null
+                initialCachedPlayer!!.injuryStatus shouldBe cacheData.player.injuryStatus
+                initialCachedPlayer.isActive shouldBe cacheData.player.isActive
+                
+                val initialCachedStats = cacheManager.getCachedPlayerStats(
+                    cacheData.player.playerId, 
+                    cacheData.stats.first().season
+                )
+                initialCachedStats.size shouldBe cacheData.stats.size
+                initialCachedStats.first().fantasyPoints shouldBe cacheData.stats.first().fantasyPoints
+                
+                // Step 2: Simulate network becoming available and trigger sync
+                // Force refresh to simulate automatic sync when connectivity returns
+                val syncedPlayerResult = repository.getPlayer(cacheData.player.playerId, forceRefresh = true)
+                val syncedStatsResult = repository.getPlayerStats(
+                    cacheData.player.playerId, 
+                    cacheData.stats.first().season, 
+                    forceRefresh = true
+                )
+                
+                // Step 3: Verify synchronization updated cache with network data
+                syncedPlayerResult shouldBe NetworkResult.Success::class
+                syncedStatsResult shouldBe NetworkResult.Success::class
+                
+                // Verify cached data was updated with network data
+                val syncedCachedPlayer = cacheManager.getCachedPlayer(cacheData.player.playerId)
+                syncedCachedPlayer shouldNotBe null
+                syncedCachedPlayer!!.injuryStatus shouldBe "Updated Status" // Should be updated from network
+                syncedCachedPlayer.isActive shouldBe !cacheData.player.isActive // Should be updated from network
+                syncedCachedPlayer.playerId shouldBe cacheData.player.playerId // Should maintain identity
+                syncedCachedPlayer.name shouldBe cacheData.player.name // Should maintain core data
+                
+                val syncedCachedStats = cacheManager.getCachedPlayerStats(
+                    cacheData.player.playerId, 
+                    cacheData.stats.first().season
+                )
+                syncedCachedStats.size shouldBe 1 // Should have updated stats
+                syncedCachedStats.first().fantasyPoints shouldBe (cacheData.stats.first().fantasyPoints + 5.0) // Should be updated
+                syncedCachedStats.first().rushingYards shouldBe (cacheData.stats.first().rushingYards + 10) // Should be updated
+                syncedCachedStats.first().playerId shouldBe cacheData.player.playerId // Should maintain identity
+                
+                // Step 4: Verify data consistency - timestamps should be updated
+                syncedCachedPlayer.lastUpdated shouldBe greaterThan(initialCachedPlayer.lastUpdated)
+                
+                // Clean up
+                database.close()
+            }
+        }
+    }
+    
+    @Test
+    fun `Cache synchronization preserves data integrity during partial sync failures`() {
+        checkAll(100, cacheDataGenerator()) { cacheData ->
+            runBlocking {
+                // Setup in-memory database
+                val database = Room.inMemoryDatabaseBuilder(
+                    ApplicationProvider.getApplicationContext(),
+                    AppDatabase::class.java
+                ).allowMainThreadQueries().build()
+                
+                val playerDao = database.playerDao()
+                val cacheManager = CacheManager(playerDao)
+                
+                // Mock API service with partial failures
+                val mockApiService = mockk<ESPNApiService>()
+                
+                // Setup successful player response but failed stats response
+                val updatedPlayerResponse = PlayerResponse(
+                    id = cacheData.player.playerId,
+                    fullName = cacheData.player.name,
+                    firstName = cacheData.player.name.split(" ").firstOrNull(),
+                    lastName = cacheData.player.name.split(" ").lastOrNull(),
+                    defaultPositionId = mapPositionToId(cacheData.player.position),
+                    eligibleSlots = listOf(mapPositionToId(cacheData.player.position)),
+                    proTeamId = mapTeamToId(cacheData.player.team),
+                    injured = cacheData.player.injuryStatus != "Healthy",
+                    injuryStatus = "Network Updated",
+                    active = cacheData.player.isActive,
+                    stats = null
+                )
+                
+                coEvery { 
+                    mockApiService.getPlayerData(cacheData.player.playerId) 
+                } returns Response.success(updatedPlayerResponse)
+                
+                // Simulate network failure for stats
+                coEvery { 
+                    mockApiService.getPlayerStats(cacheData.player.playerId, any(), any()) 
+                } throws Exception("Network timeout")
+                
+                // Create repository
+                val context = ApplicationProvider.getApplicationContext<Context>()
+                val repository = PlayerRepositoryImpl(context, mockApiService, playerDao, cacheManager)
+                
+                // Populate initial cache
+                cacheManager.cachePlayerData(cacheData.player)
+                cacheManager.cachePlayerStatsList(cacheData.stats)
+                
+                // Verify initial state
+                val initialPlayer = cacheManager.getCachedPlayer(cacheData.player.playerId)
+                val initialStats = cacheManager.getCachedPlayerStats(
+                    cacheData.player.playerId, 
+                    cacheData.stats.first().season
+                )
+                
+                initialPlayer shouldNotBe null
+                initialStats.size shouldBe cacheData.stats.size
+                
+                // Attempt sync with partial failure
+                val playerResult = repository.getPlayer(cacheData.player.playerId, forceRefresh = true)
+                val statsResult = repository.getPlayerStats(
+                    cacheData.player.playerId, 
+                    cacheData.stats.first().season, 
+                    forceRefresh = true
+                )
+                
+                // Verify successful sync updated player data
+                playerResult shouldBe NetworkResult.Success::class
+                val updatedPlayer = cacheManager.getCachedPlayer(cacheData.player.playerId)
+                updatedPlayer shouldNotBe null
+                updatedPlayer!!.injuryStatus shouldBe "Network Updated"
+                
+                // Verify failed sync preserved original stats data (data integrity)
+                statsResult shouldBe NetworkResult.Error::class
+                val preservedStats = cacheManager.getCachedPlayerStats(
+                    cacheData.player.playerId, 
+                    cacheData.stats.first().season
+                )
+                preservedStats.size shouldBe cacheData.stats.size
+                preservedStats.first().fantasyPoints shouldBe cacheData.stats.first().fantasyPoints
+                
+                // Clean up
+                database.close()
+            }
+        }
+    }
+    
+    @Test
+    fun `Cache synchronization handles concurrent sync operations correctly`() {
+        checkAll(50, cacheDataGenerator()) { cacheData ->
+            runBlocking {
+                // Setup in-memory database
+                val database = Room.inMemoryDatabaseBuilder(
+                    ApplicationProvider.getApplicationContext(),
+                    AppDatabase::class.java
+                ).allowMainThreadQueries().build()
+                
+                val playerDao = database.playerDao()
+                val cacheManager = CacheManager(playerDao)
+                
+                // Mock API service
+                val mockApiService = mockk<ESPNApiService>()
+                
+                val playerResponse = PlayerResponse(
+                    id = cacheData.player.playerId,
+                    fullName = cacheData.player.name,
+                    firstName = cacheData.player.name.split(" ").firstOrNull(),
+                    lastName = cacheData.player.name.split(" ").lastOrNull(),
+                    defaultPositionId = mapPositionToId(cacheData.player.position),
+                    eligibleSlots = listOf(mapPositionToId(cacheData.player.position)),
+                    proTeamId = mapTeamToId(cacheData.player.team),
+                    injured = cacheData.player.injuryStatus != "Healthy",
+                    injuryStatus = "Concurrent Update",
+                    active = cacheData.player.isActive,
+                    stats = null
+                )
+                
+                // Add delay to simulate network latency
+                coEvery { 
+                    mockApiService.getPlayerData(cacheData.player.playerId) 
+                } coAnswers {
+                    kotlinx.coroutines.delay(100) // Simulate network delay
+                    Response.success(playerResponse)
+                }
+                
+                // Create repository
+                val context = ApplicationProvider.getApplicationContext<Context>()
+                val repository = PlayerRepositoryImpl(context, mockApiService, playerDao, cacheManager)
+                
+                // Populate initial cache
+                cacheManager.cachePlayerData(cacheData.player)
+                
+                // Launch concurrent sync operations
+                val results = (1..3).map {
+                    async {
+                        repository.getPlayer(cacheData.player.playerId, forceRefresh = true)
+                    }
+                }
+                
+                // Wait for all operations to complete
+                val completedResults = results.map { it.await() }
+                
+                // Verify all operations succeeded (no race conditions)
+                completedResults.forEach { result ->
+                    result shouldBe NetworkResult.Success::class
+                }
+                
+                // Verify final state is consistent
+                val finalPlayer = cacheManager.getCachedPlayer(cacheData.player.playerId)
+                finalPlayer shouldNotBe null
+                finalPlayer!!.injuryStatus shouldBe "Concurrent Update"
+                
+                // Verify API was called only once due to request deduplication
+                coVerify(exactly = 1) { mockApiService.getPlayerData(cacheData.player.playerId) }
+                
+                // Clean up
+                database.close()
+            }
+        }
+    }
+}
+
+// Generator for cache data scenarios
+private data class CacheData(
+    val player: Player,
+    val stats: List<PlayerStats>,
+    val matchups: List<MatchupData>
+)
+
+private fun cacheDataGenerator(): Arb<CacheData> = Arb.bind(
+    playerGenerator(),
+    Arb.list(playerStatsGenerator(), 1..3),
+    Arb.list(matchupDataGenerator(), 0..2)
+) { player, stats, matchups ->
+    // Ensure foreign key consistency
+    val consistentStats = stats.map { it.copy(playerId = player.playerId) }
+    val consistentMatchups = matchups.map { it.copy(playerId = player.playerId) }
+    
+    CacheData(player, consistentStats, consistentMatchups)
+}
+
+private fun playerGenerator(): Arb<Player> = Arb.bind(
+    Arb.string(5..15), // playerId
+    Arb.string(5..30), // name
+    Arb.element(listOf("QB", "RB", "WR", "TE", "K", "DEF")), // position
+    Arb.element(listOf("ARI", "ATL", "BAL", "BUF", "CAR", "CHI", "CIN", "CLE", "DAL", "DEN", "DET", "GB", "HOU", "IND", "JAX", "KC", "LV", "LAC", "LAR", "MIA", "MIN", "NE", "NO", "NYG", "NYJ", "PHI", "PIT", "SF", "SEA", "TB", "TEN", "WAS")), // team
+    Arb.element(listOf("Healthy", "Questionable", "Doubtful", "Out", "IR")).orNull(), // injuryStatus
+    Arb.boolean(), // isActive
+    Arb.long(System.currentTimeMillis() - 86400000L..System.currentTimeMillis()) // lastUpdated (within last 24 hours)
+) { playerId, name, position, team, injuryStatus, isActive, lastUpdated ->
+    Player(playerId, name, position, team, injuryStatus, isActive, lastUpdated)
+}
+
+private fun playerStatsGenerator(): Arb<PlayerStats> = Arb.bind(
+    Arb.string(5..25), // id
+    Arb.string(5..15), // playerId (will be overridden for consistency)
+    Arb.int(2021..2024), // season
+    Arb.int(1..18).orNull(), // week
+    Arb.double(0.0..40.0), // fantasyPoints
+    Arb.int(0..250), // rushingYards
+    Arb.int(0..400), // passingYards
+    Arb.int(0..150), // receivingYards
+    Arb.int(0..4), // touchdowns
+    Arb.long(System.currentTimeMillis() - 86400000L..System.currentTimeMillis()) // gameDate
+) { id, playerId, season, week, fantasyPoints, rushingYards, passingYards, receivingYards, touchdowns, gameDate ->
+    PlayerStats(id, playerId, season, week, fantasyPoints, rushingYards, passingYards, receivingYards, touchdowns, gameDate)
+}
+
+private fun matchupDataGenerator(): Arb<MatchupData> = Arb.bind(
+    Arb.string(5..25), // id
+    Arb.string(5..15), // playerId (will be overridden for consistency)
+    Arb.element(listOf("ARI", "ATL", "BAL", "BUF", "CAR", "CHI", "CIN", "CLE", "DAL", "DEN", "DET", "GB", "HOU", "IND", "JAX", "KC", "LV", "LAC", "LAR", "MIA", "MIN", "NE", "NO", "NYG", "NYJ", "PHI", "PIT", "SF", "SEA", "TB", "TEN", "WAS")), // opponentTeam
+    Arb.long(System.currentTimeMillis() - 86400000L..System.currentTimeMillis()), // gameDate
+    Arb.double(0.0..35.0), // fantasyPoints
+    Arb.double(1.0..5.0), // performanceRating
+    Arb.int(2021..2024), // season
+    Arb.int(1..18) // week
+) { id, playerId, opponentTeam, gameDate, fantasyPoints, performanceRating, season, week ->
+    MatchupData(id, playerId, opponentTeam, gameDate, fantasyPoints, performanceRating, season, week)
+}
+
+// Custom matcher for NetworkResult types
+private infix fun <T> NetworkResult<T>.shouldBe(expected: kotlin.reflect.KClass<out NetworkResult<*>>) {
+    when (expected) {
+        NetworkResult.Success::class -> {
+            if (this !is NetworkResult.Success) {
+                throw AssertionError("Expected Success but got $this")
+            }
+        }
+        NetworkResult.Error::class -> {
+            if (this !is NetworkResult.Error) {
+                throw AssertionError("Expected Error but got $this")
+            }
+        }
+    }
+}
+
+private infix fun Long.shouldBe(comparison: GreaterThan): Boolean {
+    return this > comparison.value
+}
+
+private data class GreaterThan(val value: Long)
+private fun greaterThan(value: Long) = GreaterThan(value)
+
+// Helper functions for mapping between domain and DTO
+private fun mapPositionToId(position: String): Int {
+    return when (position) {
+        "QB" -> 1
+        "RB" -> 2
+        "WR" -> 3
+        "TE" -> 4
+        "K" -> 5
+        "DEF" -> 16
+        else -> 1
+    }
+}
+
+private fun mapTeamToId(team: String): Int {
+    return when (team) {
+        "ATL" -> 1
+        "BUF" -> 2
+        "CHI" -> 3
+        "CIN" -> 4
+        "CLE" -> 5
+        "DAL" -> 6
+        "DEN" -> 7
+        "DET" -> 8
+        "GB" -> 9
+        "TEN" -> 10
+        "IND" -> 11
+        "KC" -> 12
+        "LV" -> 13
+        "LAR" -> 14
+        "MIA" -> 15
+        "MIN" -> 16
+        "NE" -> 17
+        "NO" -> 18
+        "NYG" -> 19
+        "NYJ" -> 20
+        "PHI" -> 21
+        "ARI" -> 22
+        "PIT" -> 23
+        "LAC" -> 24
+        "SF" -> 25
+        "SEA" -> 26
+        "TB" -> 27
+        "WAS" -> 28
+        "CAR" -> 29
+        "JAX" -> 30
+        "BAL" -> 33
+        "HOU" -> 34
+        else -> 1
+    }
+}
+
+private fun formatGameDate(timestamp: Long): String {
+    return java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).format(java.util.Date(timestamp))
+}

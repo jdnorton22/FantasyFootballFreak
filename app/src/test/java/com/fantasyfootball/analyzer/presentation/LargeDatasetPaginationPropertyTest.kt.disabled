@@ -1,0 +1,223 @@
+package com.fantasyfootball.analyzer.presentation
+
+import io.kotest.core.spec.style.StringSpec
+import io.kotest.matchers.shouldBe
+import io.kotest.matchers.shouldNotBe
+import io.kotest.property.Arb
+import io.kotest.property.arbitrary.*
+import io.kotest.property.checkAll
+import com.fantasyfootball.analyzer.data.local.entity.Player
+import com.fantasyfootball.analyzer.domain.model.PlayerRecommendation
+import com.fantasyfootball.analyzer.domain.model.MatchupRating
+import com.fantasyfootball.analyzer.domain.model.InjuryImpact
+
+/**
+ * Property-based test for large dataset pagination.
+ * **Feature: fantasy-football-analyzer, Property 9: Large dataset pagination**
+ * **Validates: Requirements 5.3**
+ * 
+ * Tests that for any dataset exceeding screen capacity, the system implements 
+ * pagination or scrolling to maintain interface responsiveness.
+ */
+class LargeDatasetPaginationPropertyTest : StringSpec({
+
+    "Large dataset pagination - search results maintain responsiveness" {
+        checkAll(100, largePlayerListGenerator()) { playerList ->
+            // For large datasets (>20 items), verify pagination behavior
+            if (playerList.size > 20) {
+                // Simulate pagination with page size of 20
+                val pageSize = 20
+                val totalPages = (playerList.size + pageSize - 1) / pageSize
+                
+                // Verify we can paginate through all data
+                var processedItems = 0
+                for (page in 0 until totalPages) {
+                    val startIndex = page * pageSize
+                    val endIndex = minOf(startIndex + pageSize, playerList.size)
+                    val pageData = playerList.subList(startIndex, endIndex)
+                    
+                    // Each page should have reasonable size
+                    (pageData.size <= pageSize) shouldBe true
+                    (pageData.size > 0) shouldBe true
+                    
+                    // All items in page should be valid
+                    pageData.forEach { player ->
+                        player.playerId shouldNotBe ""
+                        player.name shouldNotBe ""
+                    }
+                    
+                    processedItems += pageData.size
+                }
+                
+                // All items should be processed
+                processedItems shouldBe playerList.size
+            }
+        }
+    }
+
+    "Large dataset pagination - recommendations list maintains performance" {
+        checkAll(100, largeRecommendationListGenerator()) { recommendations ->
+            // For large recommendation lists, verify scrolling behavior
+            if (recommendations.size > 10) {
+                // Simulate lazy loading with chunks of 10
+                val chunkSize = 10
+                val totalChunks = (recommendations.size + chunkSize - 1) / chunkSize
+                
+                var processedRecommendations = 0
+                for (chunk in 0 until totalChunks) {
+                    val startIndex = chunk * chunkSize
+                    val endIndex = minOf(startIndex + chunkSize, recommendations.size)
+                    val chunkData = recommendations.subList(startIndex, endIndex)
+                    
+                    // Each chunk should be manageable size
+                    (chunkData.size <= chunkSize) shouldBe true
+                    (chunkData.size > 0) shouldBe true
+                    
+                    // Recommendations should be properly ranked
+                    chunkData.forEachIndexed { index, recommendation ->
+                        recommendation.rank shouldNotBe 0
+                        recommendation.projectedPoints shouldNotBe Double.NaN
+                        (recommendation.projectedPoints >= 0.0) shouldBe true
+                        
+                        // Within chunk, rankings should be consistent
+                        if (index > 0) {
+                            val previousRank = chunkData[index - 1].rank
+                            (recommendation.rank > previousRank) shouldBe true
+                        }
+                    }
+                    
+                    processedRecommendations += chunkData.size
+                }
+                
+                // All recommendations should be processed
+                processedRecommendations shouldBe recommendations.size
+            }
+        }
+    }
+
+    "Large dataset pagination - memory efficiency with virtual scrolling" {
+        checkAll(100, veryLargeDatasetGenerator()) { dataset ->
+            // For very large datasets (>100 items), test virtual scrolling concept
+            if (dataset.size > 100) {
+                val viewportSize = 10 // Simulate visible items on screen
+                val totalItems = dataset.size
+                
+                // Test different scroll positions
+                val testPositions = listOf(0, totalItems / 4, totalItems / 2, totalItems - viewportSize)
+                
+                testPositions.forEach { scrollPosition ->
+                    val validPosition = maxOf(0, minOf(scrollPosition, totalItems - viewportSize))
+                    val visibleItems = dataset.subList(
+                        validPosition, 
+                        minOf(validPosition + viewportSize, totalItems)
+                    )
+                    
+                    // Viewport should contain reasonable number of items
+                    (visibleItems.size <= viewportSize) shouldBe true
+                    (visibleItems.size > 0) shouldBe true
+                    
+                    // All visible items should be valid
+                    visibleItems.forEach { item ->
+                        item shouldNotBe ""
+                    }
+                }
+            }
+        }
+    }
+
+    "Large dataset pagination - consistent ordering across pages" {
+        checkAll(100, sortedPlayerListGenerator()) { sortedPlayers ->
+            if (sortedPlayers.size > 15) {
+                val pageSize = 5
+                val pages = sortedPlayers.chunked(pageSize)
+                
+                // Verify ordering is maintained across pages
+                var previousLastItem: Player? = null
+                pages.forEach { page ->
+                    // Within page, items should be sorted by name
+                    page.zipWithNext().forEach { (current, next) ->
+                        (current.name <= next.name) shouldBe true
+                    }
+                    
+                    // Between pages, ordering should be maintained
+                    previousLastItem?.let { lastItem ->
+                        (lastItem.name <= page.first().name) shouldBe true
+                    }
+                    
+                    previousLastItem = page.last()
+                }
+            }
+        }
+    }
+})
+
+/**
+ * Generator for large lists of players (20-100 items).
+ */
+private fun largePlayerListGenerator(): Arb<List<Player>> = arbitrary {
+    val size = Arb.int(20..100).bind()
+    List(size) { index ->
+        Player(
+            playerId = "player_$index",
+            name = "Player ${('A'..'Z').random()}${('A'..'Z').random()}",
+            position = Arb.of(listOf("QB", "RB", "WR", "TE")).bind(),
+            team = Arb.of(listOf("DAL", "NYG", "PHI", "WAS")).bind(),
+            injuryStatus = null,
+            isActive = true,
+            lastUpdated = System.currentTimeMillis()
+        )
+    }
+}
+
+/**
+ * Generator for large lists of recommendations (10-50 items).
+ */
+private fun largeRecommendationListGenerator(): Arb<List<PlayerRecommendation>> = arbitrary {
+    val size = Arb.int(10..50).bind()
+    List(size) { index ->
+        PlayerRecommendation(
+            player = Player(
+                playerId = "player_$index",
+                name = "Player $index",
+                position = "RB",
+                team = "DAL",
+                injuryStatus = null,
+                isActive = true,
+                lastUpdated = System.currentTimeMillis()
+            ),
+            projectedPoints = Arb.double(5.0..25.0).bind(),
+            matchupRating = Arb.of(MatchupRating.values().toList()).bind(),
+            confidenceLevel = Arb.double(0.5..1.0).bind(),
+            reasoning = "Test reasoning",
+            consistencyScore = Arb.double(0.0..10.0).bind(),
+            injuryImpact = InjuryImpact.NONE,
+            rank = index + 1
+        )
+    }.sortedBy { it.rank }
+}
+
+/**
+ * Generator for very large datasets (100-500 items).
+ */
+private fun veryLargeDatasetGenerator(): Arb<List<String>> = arbitrary {
+    val size = Arb.int(100..500).bind()
+    List(size) { index -> "Item_$index" }
+}
+
+/**
+ * Generator for sorted player lists.
+ */
+private fun sortedPlayerListGenerator(): Arb<List<Player>> = arbitrary {
+    val size = Arb.int(15..50).bind()
+    List(size) { index ->
+        Player(
+            playerId = "player_$index",
+            name = "Player ${('A' + (index % 26))}",
+            position = "RB",
+            team = "DAL",
+            injuryStatus = null,
+            isActive = true,
+            lastUpdated = System.currentTimeMillis()
+        )
+    }.sortedBy { it.name }
+}

@@ -1,0 +1,226 @@
+package com.fantasyfootball.analyzer.data.remote
+
+import io.kotest.core.spec.style.StringSpec
+import io.kotest.matchers.shouldBe
+import io.kotest.matchers.shouldNotBe
+import io.kotest.property.Arb
+import io.kotest.property.arbitrary.*
+import io.kotest.property.checkAll
+import kotlinx.coroutines.delay
+import okhttp3.mockwebserver.MockResponse
+import okhttp3.mockwebserver.MockWebServer
+import retrofit2.Retrofit
+import retrofit2.converter.gson.GsonConverterFactory
+import java.util.concurrent.atomic.AtomicInteger
+
+/**
+ * **Feature: fantasy-football-analyzer, Property 11: Rate limit handling**
+ * **Validates: Requirements 6.5**
+ * 
+ * Property-based test verifying that the system implements proper rate limit handling:
+ * - Exponential backoff for API rate limit scenarios
+ * - Request queue system for handling rate-limited requests
+ * - Intelligent retry scheduling
+ */
+class RateLimitHandlingPropertyTest : StringSpec({
+    
+    "Rate limit handling implements exponential backoff with request queuing" {
+        val mockWebServer = MockWebServer()
+        val requestTimes = mutableListOf<Long>()
+        val requestCounter = AtomicInteger(0)
+        
+        mockWebServer.dispatcher = object : okhttp3.mockwebserver.Dispatcher() {
+            override fun dispatch(request: okhttp3.mockwebserver.RecordedRequest): MockResponse {
+                val requestTime = System.currentTimeMillis()
+                requestTimes.add(requestTime)
+                val count = requestCounter.incrementAndGet()
+                
+                // Return rate limit error for first few requests, then success
+                return if (count <= 2) {
+                    MockResponse()
+                        .setResponseCode(429)
+                        .setBody("""{"error":{"code":"RATE_LIMIT","message":"Too many requests"}}""")
+                } else {
+                    MockResponse()
+                        .setResponseCode(200)
+                        .setBody("""{"id":"test","fullName":"Test Player","defaultPositionId":1,"proTeamId":1,"injured":false,"active":true}""")
+                }
+            }
+        }
+        mockWebServer.start()
+        
+        val apiService = Retrofit.Builder()
+            .baseUrl(mockWebServer.url("/"))
+            .addConverterFactory(GsonConverterFactory.create())
+            .build()
+            .create(ESPNApiService::class.java)
+        
+        try {
+            checkAll<String>(
+                iterations = 10,
+                Arb.string(1..10)
+            ) { playerId ->
+                requestTimes.clear()
+                requestCounter.set(0)
+                
+                // Make a request that will trigger rate limiting and retry
+                val result = NetworkHelper.safeApiCall(
+                    requestId = "test_rate_limit_$playerId",
+                    priority = 1
+                ) {
+                    apiService.getPlayerData(playerId)
+                }
+                
+                // Property: Rate limited requests should eventually succeed
+                result shouldNotBe null
+                
+                // Property: Multiple requests should be made due to rate limiting
+                requestTimes.size shouldBe 3 // Initial + 2 retries before success
+                
+                // Property: Requests should have increasing delays (exponential backoff)
+                if (requestTimes.size >= 3) {
+                    val firstDelay = requestTimes[1] - requestTimes[0]
+                    val secondDelay = requestTimes[2] - requestTimes[1]
+                    
+                    // Second delay should be longer than first (exponential backoff)
+                    secondDelay shouldBe (firstDelay * 1.5).toLong().coerceAtLeast(firstDelay + 100)
+                }
+            }
+        } finally {
+            mockWebServer.shutdown()
+        }
+    }
+    
+    "Request queue handles multiple concurrent rate-limited requests" {
+        val mockWebServer = MockWebServer()
+        val requestCounter = AtomicInteger(0)
+        val concurrentRequestTimes = mutableMapOf<String, Long>()
+        
+        mockWebServer.dispatcher = object : okhttp3.mockwebserver.Dispatcher() {
+            override fun dispatch(request: okhttp3.mockwebserver.RecordedRequest): MockResponse {
+                val path = request.path ?: ""
+                val playerId = path.substringAfterLast("/")
+                concurrentRequestTimes[playerId] = System.currentTimeMillis()
+                
+                val count = requestCounter.incrementAndGet()
+                
+                // Rate limit first few requests
+                return if (count <= 5) {
+                    MockResponse()
+                        .setResponseCode(429)
+                        .setBody("""{"error":{"code":"RATE_LIMIT","message":"Too many requests"}}""")
+                } else {
+                    MockResponse()
+                        .setResponseCode(200)
+                        .setBody("""{"id":"$playerId","fullName":"Test Player","defaultPositionId":1,"proTeamId":1,"injured":false,"active":true}""")
+                }
+            }
+        }
+        mockWebServer.start()
+        
+        val apiService = Retrofit.Builder()
+            .baseUrl(mockWebServer.url("/"))
+            .addConverterFactory(GsonConverterFactory.create())
+            .build()
+            .create(ESPNApiService::class.java)
+        
+        try {
+            checkAll<List<String>>(
+                iterations = 5,
+                Arb.list(Arb.string(1..10), 3..5)
+            ) { playerIds ->
+                requestCounter.set(0)
+                concurrentRequestTimes.clear()
+                
+                // Make multiple concurrent requests that will be rate limited
+                val results = playerIds.map { playerId ->
+                    NetworkHelper.safeApiCall(
+                        requestId = "concurrent_test_$playerId",
+                        priority = 1
+                    ) {
+                        apiService.getPlayerData(playerId)
+                    }
+                }
+                
+                // Property: All requests should eventually complete
+                results.forEach { result ->
+                    result shouldNotBe null
+                }
+                
+                // Property: Request queue should handle concurrent requests
+                NetworkHelper.getQueueSize() shouldBe 0 // Queue should be empty after processing
+                
+                // Property: Requests should be processed with proper spacing
+                val requestTimes = concurrentRequestTimes.values.sorted()
+                if (requestTimes.size >= 2) {
+                    val minDelay = requestTimes.zipWithNext { a, b -> b - a }.minOrNull() ?: 0
+                    minDelay shouldBe 100L.coerceAtLeast(0) // At least some delay between requests
+                }
+            }
+        } finally {
+            mockWebServer.shutdown()
+        }
+    }
+    
+    "Network errors trigger intelligent retry with exponential backoff" {
+        val mockWebServer = MockWebServer()
+        val retryAttempts = AtomicInteger(0)
+        val retryTimes = mutableListOf<Long>()
+        
+        mockWebServer.dispatcher = object : okhttp3.mockwebserver.Dispatcher() {
+            override fun dispatch(request: okhttp3.mockwebserver.RecordedRequest): MockResponse {
+                val attempt = retryAttempts.incrementAndGet()
+                retryTimes.add(System.currentTimeMillis())
+                
+                return when (attempt) {
+                    1 -> MockResponse().setResponseCode(503) // Service unavailable
+                    2 -> MockResponse().setResponseCode(502) // Bad gateway
+                    else -> MockResponse()
+                        .setResponseCode(200)
+                        .setBody("""{"id":"test","fullName":"Test Player","defaultPositionId":1,"proTeamId":1,"injured":false,"active":true}""")
+                }
+            }
+        }
+        mockWebServer.start()
+        
+        val apiService = Retrofit.Builder()
+            .baseUrl(mockWebServer.url("/"))
+            .addConverterFactory(GsonConverterFactory.create())
+            .build()
+            .create(ESPNApiService::class.java)
+        
+        try {
+            checkAll<String>(
+                iterations = 5,
+                Arb.string(1..10)
+            ) { playerId ->
+                retryAttempts.set(0)
+                retryTimes.clear()
+                
+                val result = NetworkHelper.safeApiCall(
+                    requestId = "retry_test_$playerId",
+                    priority = 1
+                ) {
+                    apiService.getPlayerData(playerId)
+                }
+                
+                // Property: Recoverable errors should be retried and eventually succeed
+                result shouldNotBe null
+                
+                // Property: Multiple attempts should be made
+                retryAttempts.get() shouldBe 3 // Initial + 2 retries
+                
+                // Property: Retry delays should increase exponentially
+                if (retryTimes.size >= 3) {
+                    val firstRetryDelay = retryTimes[1] - retryTimes[0]
+                    val secondRetryDelay = retryTimes[2] - retryTimes[1]
+                    
+                    // Each retry should have a longer delay
+                    secondRetryDelay shouldBe firstRetryDelay.coerceAtLeast(1000) // At least 1 second base delay
+                }
+            }
+        } finally {
+            mockWebServer.shutdown()
+        }
+    }
+})

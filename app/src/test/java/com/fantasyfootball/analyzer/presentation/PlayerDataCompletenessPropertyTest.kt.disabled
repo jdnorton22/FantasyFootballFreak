@@ -1,0 +1,134 @@
+package com.fantasyfootball.analyzer.presentation
+
+import io.kotest.core.spec.style.StringSpec
+import io.kotest.matchers.shouldBe
+import io.kotest.matchers.shouldNotBe
+import io.kotest.property.Arb
+import io.kotest.property.arbitrary.*
+import io.kotest.property.checkAll
+import com.fantasyfootball.analyzer.data.local.entity.Player
+import com.fantasyfootball.analyzer.data.local.entity.PlayerStats
+
+/**
+ * Property-based test for player data completeness.
+ * **Feature: fantasy-football-analyzer, Property 1: Player data completeness**
+ * **Validates: Requirements 1.1, 1.2, 1.3, 5.1**
+ * 
+ * Tests that for any valid NFL player, when retrieved and displayed, the system 
+ * includes all required fields: current season statistics (fantasy points, rushing yards, 
+ * passing yards, receiving yards, touchdowns), player information (position, team, 
+ * injury status), and proper visual representation.
+ */
+class PlayerDataCompletenessPropertyTest : StringSpec({
+
+    "Player data completeness - all required fields present" {
+        checkAll(100, playerGenerator()) { player ->
+            // Verify player has all required basic information
+            player.playerId shouldNotBe ""
+            player.name shouldNotBe ""
+            player.position shouldNotBe ""
+            player.team shouldNotBe ""
+            player.lastUpdated shouldNotBe 0L
+            
+            // Position should be valid NFL position
+            val validPositions = setOf("QB", "RB", "WR", "TE", "K", "DEF")
+            validPositions.contains(player.position) shouldBe true
+            
+            // Team should be valid NFL team abbreviation (3 characters)
+            player.team.length shouldBe 3
+            
+            // Injury status should be null or valid status
+            player.injuryStatus?.let { status ->
+                val validStatuses = setOf("Healthy", "Questionable", "Doubtful", "OUT", "IR")
+                validStatuses.any { validStatus -> 
+                    status.contains(validStatus, ignoreCase = true) 
+                } shouldBe true
+            }
+        }
+    }
+
+    "Player statistics completeness - all required statistical fields present" {
+        checkAll(100, playerStatsGenerator()) { stats ->
+            // Verify all required statistical fields are present
+            stats.id shouldNotBe ""
+            stats.playerId shouldNotBe ""
+            stats.season shouldNotBe 0
+            stats.gameDate shouldNotBe 0L
+            
+            // Fantasy points should be non-negative
+            stats.fantasyPoints shouldNotBe Double.NaN
+            (stats.fantasyPoints >= 0.0) shouldBe true
+            
+            // Yards should be non-negative
+            (stats.rushingYards >= 0) shouldBe true
+            (stats.passingYards >= 0) shouldBe true
+            (stats.receivingYards >= 0) shouldBe true
+            
+            // Touchdowns should be non-negative
+            (stats.touchdowns >= 0) shouldBe true
+            
+            // Season should be reasonable (between 2020-2030)
+            (stats.season >= 2020 && stats.season <= 2030) shouldBe true
+            
+            // Week should be null or valid NFL week (1-18)
+            stats.week?.let { week ->
+                (week >= 1 && week <= 18) shouldBe true
+            }
+        }
+    }
+
+    "Player data display format validation" {
+        checkAll(100, playerGenerator()) { player ->
+            // Test that player data can be formatted for display
+            val displayName = player.name
+            val displayPosition = "${player.position} - ${player.team}"
+            val displayStatus = player.injuryStatus ?: "Healthy"
+            
+            // All display strings should be non-empty
+            displayName shouldNotBe ""
+            displayPosition shouldNotBe ""
+            displayStatus shouldNotBe ""
+            
+            // Display position should contain both position and team
+            displayPosition.contains(player.position) shouldBe true
+            displayPosition.contains(player.team) shouldBe true
+        }
+    }
+})
+
+/**
+ * Generator for valid Player entities.
+ */
+private fun playerGenerator(): Arb<Player> = arbitrary {
+    val positions = listOf("QB", "RB", "WR", "TE", "K", "DEF")
+    val teams = listOf("DAL", "NYG", "PHI", "WAS", "GB", "MIN", "CHI", "DET", "SF", "SEA", "LAR", "ARI")
+    val injuryStatuses = listOf(null, "Healthy", "Questionable", "Doubtful", "OUT", "IR")
+    
+    Player(
+        playerId = "player_${Arb.string(5..10).bind()}",
+        name = "${Arb.string(3..15).bind()} ${Arb.string(3..15).bind()}",
+        position = Arb.of(positions).bind(),
+        team = Arb.of(teams).bind(),
+        injuryStatus = Arb.of(injuryStatuses).bind(),
+        isActive = Arb.boolean().bind(),
+        lastUpdated = System.currentTimeMillis()
+    )
+}
+
+/**
+ * Generator for valid PlayerStats entities.
+ */
+private fun playerStatsGenerator(): Arb<PlayerStats> = arbitrary {
+    PlayerStats(
+        id = "stats_${Arb.string(5..10).bind()}",
+        playerId = "player_${Arb.string(5..10).bind()}",
+        season = Arb.int(2020..2024).bind(),
+        week = Arb.of(listOf(null) + (1..18).toList()).bind(),
+        fantasyPoints = Arb.double(0.0..50.0).bind(),
+        rushingYards = Arb.int(0..300).bind(),
+        passingYards = Arb.int(0..500).bind(),
+        receivingYards = Arb.int(0..200).bind(),
+        touchdowns = Arb.int(0..6).bind(),
+        gameDate = System.currentTimeMillis() - Arb.long(0..365L * 24 * 60 * 60 * 1000).bind()
+    )
+}

@@ -1,0 +1,10 @@
+<resources>
+    <string name="app_name">Fantasy Football Analyzer</string>
+    <string name="player_search_hint">Search for NFL players...</string>
+    <string name="loading">Loading...</string>
+    <string name="error_network">Network error occurred</string>
+    <string name="error_generic">An error occurred</string>
+    <string name="retry">Retry</string>
+    <string name="offline_mode">Offline Mode</string>
+    <string name="data_outdated">Data may be outdated</string>
+</resources>

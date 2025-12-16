@@ -1,0 +1,256 @@
+package com.fantasyfootball.analyzer.data.remote
+
+import io.kotest.core.spec.style.StringSpec
+import io.kotest.matchers.shouldBe
+import io.kotest.matchers.shouldNotBe
+import io.kotest.property.Arb
+import io.kotest.property.arbitrary.*
+import io.kotest.property.checkAll
+import kotlinx.coroutines.delay
+import okhttp3.mockwebserver.MockResponse
+import okhttp3.mockwebserver.MockWebServer
+import retrofit2.Retrofit
+import retrofit2.converter.gson.GsonConverterFactory
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
+
+/**
+ * **Feature: fantasy-football-analyzer, Property 10: API request optimization**
+ * **Validates: Requirements 6.1, 6.2, 6.3**
+ * 
+ * Property-based test verifying that the API service implements proper request optimization:
+ * - Request throttling to prevent excessive API calls
+ * - Cached data serving for duplicate requests
+ * - Incremental updates rather than complete data refreshes
+ */
+class ApiRequestOptimizationPropertyTest : StringSpec({
+    
+    "API request throttling prevents excessive calls within time window" {
+        val mockWebServer = MockWebServer()
+        val requestCounter = AtomicInteger(0)
+        
+        // Setup mock server that counts requests
+        mockWebServer.dispatcher = object : okhttp3.mockwebserver.Dispatcher() {
+            override fun dispatch(request: okhttp3.mockwebserver.RecordedRequest): MockResponse {
+                requestCounter.incrementAndGet()
+                return MockResponse()
+                    .setResponseCode(200)
+                    .setBody("""{"id":"test","fullName":"Test Player","defaultPositionId":1,"proTeamId":1,"injured":false,"active":true}""")
+            }
+        }
+        mockWebServer.start()
+        
+        val apiService = Retrofit.Builder()
+            .baseUrl(mockWebServer.url("/"))
+            .addConverterFactory(GsonConverterFactory.create())
+            .build()
+            .create(ESPNApiService::class.java)
+        
+        try {
+            checkAll<List<String>>(
+                iterations = 50,
+                Arb.list(Arb.string(1..10), 5..20)
+            ) { playerIds ->
+                requestCounter.set(0)
+                val startTime = System.currentTimeMillis()
+                
+                // Make multiple rapid requests for the same players
+                playerIds.forEach { playerId ->
+                    try {
+                        apiService.getPlayerData(playerId)
+                    } catch (e: Exception) {
+                        // Ignore network errors for this test
+                    }
+                }
+                
+                val endTime = System.currentTimeMillis()
+                val duration = endTime - startTime
+                val requestCount = requestCounter.get()
+                
+                // Property: Request rate should be throttled
+                // If requests complete too quickly, throttling should limit the rate
+                if (duration < 1000) { // Less than 1 second for all requests
+                    val maxExpectedRequests = (duration / 100).toInt() + 1 // Allow ~10 requests per second
+                    requestCount shouldBe maxExpectedRequests.coerceAtMost(playerIds.size)
+                }
+            }
+        } finally {
+            mockWebServer.shutdown()
+        }
+    }
+    
+    "Duplicate requests within cache window serve cached data" {
+        val mockWebServer = MockWebServer()
+        val requestTracker = ConcurrentHashMap<String, AtomicInteger>()
+        
+        mockWebServer.dispatcher = object : okhttp3.mockwebserver.Dispatcher() {
+            override fun dispatch(request: okhttp3.mockwebserver.RecordedRequest): MockResponse {
+                val path = request.path ?: ""
+                requestTracker.computeIfAbsent(path) { AtomicInteger(0) }.incrementAndGet()
+                
+                return MockResponse()
+                    .setResponseCode(200)
+                    .setBody("""{"id":"test","fullName":"Test Player","defaultPositionId":1,"proTeamId":1,"injured":false,"active":true}""")
+            }
+        }
+        mockWebServer.start()
+        
+        val apiService = Retrofit.Builder()
+            .baseUrl(mockWebServer.url("/"))
+            .addConverterFactory(GsonConverterFactory.create())
+            .build()
+            .create(ESPNApiService::class.java)
+        
+        try {
+            checkAll<String>(
+                iterations = 30,
+                Arb.string(1..10)
+            ) { playerId ->
+                requestTracker.clear()
+                
+                // Make the same request multiple times rapidly
+                repeat(5) {
+                    try {
+                        apiService.getPlayerData(playerId)
+                    } catch (e: Exception) {
+                        // Ignore network errors for this test
+                    }
+                }
+                
+                val path = "/fantasy/football/players/$playerId"
+                val actualRequests = requestTracker[path]?.get() ?: 0
+                
+                // Property: Duplicate requests should be minimized through caching
+                // In a properly optimized system, multiple identical requests should result in fewer actual network calls
+                actualRequests shouldBe 1 // Ideally only one request should reach the server
+            }
+        } finally {
+            mockWebServer.shutdown()
+        }
+    }
+    
+    "Incremental updates request only changed data" {
+        val mockWebServer = MockWebServer()
+        val requestParameters = mutableListOf<Map<String, String>>()
+        
+        mockWebServer.dispatcher = object : okhttp3.mockwebserver.Dispatcher() {
+            override fun dispatch(request: okhttp3.mockwebserver.RecordedRequest): MockResponse {
+                val url = request.requestUrl
+                val params = mutableMapOf<String, String>()
+                url?.queryParameterNames?.forEach { paramName ->
+                    url.queryParameter(paramName)?.let { paramValue ->
+                        params[paramName] = paramValue
+                    }
+                }
+                requestParameters.add(params)
+                
+                return MockResponse()
+                    .setResponseCode(200)
+                    .setBody("""{"playerId":"test","season":2023,"fantasyPoints":15.5,"rushingYards":100,"passingYards":0,"receivingYards":0,"totalTouchdowns":1}""")
+            }
+        }
+        mockWebServer.start()
+        
+        val apiService = Retrofit.Builder()
+            .baseUrl(mockWebServer.url("/"))
+            .addConverterFactory(GsonConverterFactory.create())
+            .build()
+            .create(ESPNApiService::class.java)
+        
+        try {
+            checkAll<Pair<String, Int>>(
+                iterations = 20,
+                Arb.pair(Arb.string(1..10), Arb.int(2020..2024))
+            ) { (playerId, season) ->
+                requestParameters.clear()
+                
+                // Simulate requesting stats for different weeks
+                val weeks = listOf(1, 2, 3, 4, 5)
+                weeks.forEach { week ->
+                    try {
+                        apiService.getPlayerStats(playerId, season, week)
+                        kotlinx.coroutines.delay(10) // Small delay to ensure requests are processed
+                    } catch (e: Exception) {
+                        // Ignore network errors for this test
+                    }
+                }
+                
+                // Property: Incremental requests should include specific parameters
+                // Each request should specify the exact week to avoid fetching all data
+                requestParameters.forEach { params ->
+                    params["season"] shouldBe season.toString()
+                    params["week"] shouldNotBe null // Week parameter should be present for incremental updates
+                }
+                
+                // Property: Multiple incremental requests should be more efficient than one large request
+                val hasIncrementalParams = requestParameters.any { it.containsKey("week") }
+                hasIncrementalParams shouldBe true
+            }
+        } finally {
+            mockWebServer.shutdown()
+        }
+    }
+    
+    "Rate limit handling implements exponential backoff" {
+        val mockWebServer = MockWebServer()
+        val requestTimes = mutableListOf<Long>()
+        var responseCode = 429 // Rate limit error
+        
+        mockWebServer.dispatcher = object : okhttp3.mockwebserver.Dispatcher() {
+            override fun dispatch(request: okhttp3.mockwebserver.RecordedRequest): MockResponse {
+                requestTimes.add(System.currentTimeMillis())
+                
+                // Return rate limit error for first few requests, then success
+                return if (requestTimes.size <= 3) {
+                    MockResponse()
+                        .setResponseCode(responseCode)
+                        .setBody("""{"error":{"code":"RATE_LIMIT","message":"Too many requests"}}""")
+                } else {
+                    MockResponse()
+                        .setResponseCode(200)
+                        .setBody("""{"id":"test","fullName":"Test Player","defaultPositionId":1,"proTeamId":1,"injured":false,"active":true}""")
+                }
+            }
+        }
+        mockWebServer.start()
+        
+        val apiService = Retrofit.Builder()
+            .baseUrl(mockWebServer.url("/"))
+            .addConverterFactory(GsonConverterFactory.create())
+            .build()
+            .create(ESPNApiService::class.java)
+        
+        try {
+            checkAll<String>(
+                iterations = 10,
+                Arb.string(1..10)
+            ) { playerId ->
+                requestTimes.clear()
+                responseCode = 429
+                
+                // Make requests that will trigger rate limiting
+                repeat(4) {
+                    try {
+                        val result = NetworkHelper.safeApiCall { apiService.getPlayerData(playerId) }
+                        if (result is NetworkResult.Error && NetworkHelper.isRateLimitError(result)) {
+                            delay(100L * (it + 1)) // Simulate exponential backoff
+                        }
+                    } catch (e: Exception) {
+                        delay(100L * (it + 1)) // Simulate exponential backoff on error
+                    }
+                }
+                
+                // Property: Requests after rate limiting should have increasing delays
+                if (requestTimes.size >= 3) {
+                    val firstDelay = requestTimes[1] - requestTimes[0]
+                    val secondDelay = requestTimes[2] - requestTimes[1]
+                    
+                    // Exponential backoff means each delay should be longer than the previous
+                    secondDelay shouldBe (firstDelay * 1.5).toLong().coerceAtLeast(firstDelay + 50)
+                }
+            }
+        } finally {
+            mockWebServer.shutdown()
+        }
+    }
+})

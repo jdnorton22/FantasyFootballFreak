@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- Base application theme. -->
+    <style name="Theme.FantasyFootballAnalyzer" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <!-- Customize your theme here. -->
+        <item name="colorPrimary">@color/fantasy_green</item>
+        <item name="colorPrimaryVariant">@color/fantasy_blue</item>
+        <item name="colorOnPrimary">@android:color/white</item>
+        <item name="colorSecondary">@color/fantasy_orange</item>
+        <item name="colorOnSecondary">@android:color/white</item>
+    </style>
+</resources>

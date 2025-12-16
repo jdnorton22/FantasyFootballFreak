@@ -1,0 +1,158 @@
+package com.fantasyfootball.analyzer.domain.usecase
+
+import com.fantasyfootball.analyzer.data.local.entity.MatchupData
+import com.fantasyfootball.analyzer.data.local.entity.Player
+import com.fantasyfootball.analyzer.data.local.entity.PlayerStats
+import com.fantasyfootball.analyzer.data.remote.NetworkResult
+import com.fantasyfootball.analyzer.domain.repository.PlayerRepository
+import io.kotest.core.spec.style.StringSpec
+import io.kotest.matchers.shouldBe
+import io.kotest.matchers.collections.shouldHaveSize
+import io.kotest.matchers.doubles.shouldBeGreaterThanOrEqual
+import io.kotest.property.Arb
+import io.kotest.property.arbitrary.*
+import io.kotest.property.checkAll
+import io.mockk.coEvery
+import io.mockk.mockk
+import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.runBlocking
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
+import java.util.*
+
+/**
+ * **Feature: fantasy-football-analyzer, Property 2: Historical matchup data span**
+ * **Validates: Requirements 2.1, 2.2, 2.5**
+ * 
+ * Property test verifying that matchup analysis retrieves exactly 3 seasons of historical data
+ * and calculates accurate averages and comparisons to season performance.
+ */
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [28])
+class HistoricalMatchupDataSpanPropertyTest : StringSpec({
+
+    "Property 2: Historical matchup data span - For any valid player-opponent combination, when matchup analysis is requested, the system should retrieve exactly 3 seasons of historical data and calculate accurate averages and comparisons to season performance" {
+        checkAll(100, playerOpponentGenerator()) { (playerId, playerName, opponentTeam, historicalGames, seasonStats) ->
+            runBlocking {
+            // Arrange
+            val mockRepository = mockk<PlayerRepository>()
+            val matchupAnalyzer = MatchupAnalyzerImpl(mockRepository)
+            
+            val player = Player(
+                playerId = playerId,
+                name = playerName,
+                position = "RB",
+                team = "TEST",
+                injuryStatus = null,
+                isActive = true,
+                lastUpdated = System.currentTimeMillis()
+            )
+            
+            coEvery { mockRepository.getMatchupHistory(playerId, opponentTeam, any()) } returns NetworkResult.Success(historicalGames)
+            coEvery { mockRepository.getPlayer(playerId, any()) } returns NetworkResult.Success(player)
+            coEvery { mockRepository.getPlayerStats(playerId, 2024, any()) } returns NetworkResult.Success(seasonStats)
+            
+            // Act
+            val result = matchupAnalyzer.analyzeMatchup(playerId, opponentTeam)
+            
+            // Assert
+            result shouldBe NetworkResult.Success::class
+            if (result is NetworkResult.Success) {
+                val analysis = result.data
+                
+                // Verify data spans exactly 3 seasons (2022, 2023, 2024)
+                val seasons = historicalGames.map { it.season }.distinct().sorted()
+                if (seasons.isNotEmpty()) {
+                    seasons shouldHaveSize 3
+                    seasons shouldBe listOf(2022, 2023, 2024)
+                }
+                
+                // Verify average calculation is accurate
+                if (historicalGames.isNotEmpty()) {
+                    val expectedAverage = historicalGames.map { it.fantasyPoints }.average()
+                    analysis.averageFantasyPoints shouldBe expectedAverage
+                }
+                
+                // Verify season comparison calculation
+                if (seasonStats.isNotEmpty() && historicalGames.isNotEmpty()) {
+                    val seasonAverage = seasonStats.map { it.fantasyPoints }.average()
+                    val matchupAverage = historicalGames.map { it.fantasyPoints }.average()
+                    val expectedComparison = ((matchupAverage - seasonAverage) / seasonAverage) * 100
+                    analysis.comparisonToSeasonAverage shouldBe expectedComparison
+                }
+                
+                // Verify sample size matches historical games
+                analysis.sampleSize shouldBe historicalGames.size
+                analysis.historicalGames shouldHaveSize historicalGames.size
+                
+                // Verify confidence level is appropriate for sample size
+                when (historicalGames.size) {
+                    in 5..Int.MAX_VALUE -> analysis.confidenceLevel shouldBe 0.9
+                    in 2..4 -> analysis.confidenceLevel shouldBe 0.6
+                    else -> analysis.confidenceLevel shouldBe 0.3
+                }
+            }
+            }
+        }
+    }
+})
+
+private fun playerOpponentGenerator() = arbitrary { rs ->
+    val playerId = Arb.string(5..10).next(rs)
+    val playerName = Arb.string(5..15).next(rs)
+    val opponentTeam = Arb.element("DAL", "NYG", "PHI", "WAS", "GB", "MIN", "CHI", "DET").next(rs)
+    
+    // Generate historical games spanning exactly 3 seasons (2022, 2023, 2024)
+    val gamesPerSeason = Arb.int(1..6).next(rs)
+    val historicalGames = mutableListOf<MatchupData>()
+    
+    for (season in listOf(2022, 2023, 2024)) {
+        repeat(gamesPerSeason) { week ->
+            val calendar = Calendar.getInstance()
+            calendar.set(season, Calendar.SEPTEMBER, 1 + (week * 7))
+            
+            historicalGames.add(
+                MatchupData(
+                    id = "${playerId}_${opponentTeam}_${season}_${week + 1}",
+                    playerId = playerId,
+                    opponentTeam = opponentTeam,
+                    gameDate = calendar.timeInMillis,
+                    fantasyPoints = Arb.double(0.0, 30.0).next(rs),
+                    performanceRating = Arb.double(0.0, 10.0).next(rs),
+                    season = season,
+                    week = week + 1
+                )
+            )
+        }
+    }
+    
+    // Generate season stats for 2024
+    val seasonStats = (1..17).map { week ->
+        val calendar = Calendar.getInstance()
+        calendar.set(2024, Calendar.SEPTEMBER, week * 7)
+        
+        PlayerStats(
+            id = "${playerId}_2024_${week}",
+            playerId = playerId,
+            season = 2024,
+            week = week,
+            fantasyPoints = Arb.double(0.0, 30.0).next(rs),
+            rushingYards = Arb.int(0, 200).next(rs),
+            passingYards = Arb.int(0, 400).next(rs),
+            receivingYards = Arb.int(0, 150).next(rs),
+            touchdowns = Arb.int(0, 4).next(rs),
+            gameDate = calendar.timeInMillis
+        )
+    }
+    
+    Quintuple(playerId, playerName, opponentTeam, historicalGames, seasonStats)
+}
+
+private data class Quintuple<A, B, C, D, E>(
+    val first: A,
+    val second: B,
+    val third: C,
+    val fourth: D,
+    val fifth: E
+)

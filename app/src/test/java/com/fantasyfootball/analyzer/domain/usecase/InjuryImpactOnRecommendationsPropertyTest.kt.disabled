@@ -1,0 +1,186 @@
+package com.fantasyfootball.analyzer.domain.usecase
+
+import com.fantasyfootball.analyzer.data.local.entity.Player
+import com.fantasyfootball.analyzer.data.local.entity.PlayerStats
+import com.fantasyfootball.analyzer.data.remote.NetworkResult
+import com.fantasyfootball.analyzer.domain.repository.PlayerRepository
+import com.fantasyfootball.analyzer.domain.model.InjuryImpact
+import io.kotest.core.spec.style.StringSpec
+import io.kotest.matchers.shouldBe
+import io.kotest.matchers.shouldNotBe
+import io.kotest.matchers.string.shouldContain
+import io.kotest.property.Arb
+import io.kotest.property.arbitrary.*
+import io.kotest.property.checkAll
+import io.mockk.coEvery
+import io.mockk.mockk
+import kotlinx.coroutines.runBlocking
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
+import java.util.*
+
+/**
+ * **Feature: fantasy-football-analyzer, Property 8: Injury impact on recommendations**
+ * **Validates: Requirements 4.5**
+ * 
+ * Property test verifying that for any player with injury status, when generating recommendations, 
+ * the system should adjust rankings and projections appropriately based on availability.
+ */
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [28])
+class InjuryImpactOnRecommendationsPropertyTest : StringSpec({
+
+    "Property 8: Injury impact on recommendations - For any player with injury status, when generating recommendations, the system should adjust rankings and projections appropriately based on availability" {
+        checkAll(100, playerWithInjuryGenerator()) { (players, expectedInjuryImpacts) ->
+            runBlocking {
+                // Arrange
+                val mockRepository = mockk<PlayerRepository>()
+                val matchupAnalyzer = MatchupAnalyzerImpl(mockRepository)
+                
+                // Mock repository responses for each player
+                players.forEachIndexed { index, player ->
+                    val seasonStats = generateSeasonStats(player.playerId)
+                    coEvery { mockRepository.getPlayer(player.playerId, any()) } returns NetworkResult.Success(player)
+                    coEvery { mockRepository.getPlayerStats(player.playerId, 2024, any()) } returns NetworkResult.Success(seasonStats)
+                }
+                
+                // Act
+                val result = matchupAnalyzer.generateWeeklyRecommendations(players.map { it.playerId })
+                
+                // Assert
+                result shouldBe NetworkResult.Success::class
+                if (result is NetworkResult.Success) {
+                    val recommendations = result.data
+                    
+                    // Verify each recommendation has correct injury impact
+                    recommendations.forEachIndexed { index, recommendation ->
+                        val expectedImpact = expectedInjuryImpacts[index]
+                        
+                        // Verify injury impact is correctly determined
+                        recommendation.injuryImpact shouldBe expectedImpact
+                        
+                        // Verify injury impact affects reasoning
+                        when (expectedImpact) {
+                            InjuryImpact.NONE -> {
+                                // Reasoning should not mention injury concerns
+                                recommendation.reasoning shouldNotBe null
+                            }
+                            InjuryImpact.MINOR -> {
+                                recommendation.reasoning shouldContain "minor injury concern"
+                            }
+                            InjuryImpact.MODERATE -> {
+                                recommendation.reasoning shouldContain "significant injury risk"
+                            }
+                            InjuryImpact.MAJOR -> {
+                                recommendation.reasoning shouldContain "major injury concern"
+                            }
+                            InjuryImpact.OUT -> {
+                                recommendation.reasoning shouldContain "currently injured"
+                            }
+                        }
+                        
+                        // Verify player with OUT status should have significantly lower projected points
+                        if (expectedImpact == InjuryImpact.OUT) {
+                            // Players who are OUT should still have their base projection
+                            // but the reasoning should clearly indicate they're injured
+                            recommendation.projectedPoints shouldNotBe null
+                            recommendation.reasoning shouldContain "currently injured"
+                        }
+                        
+                        // Verify injury impact is properly reflected in the recommendation
+                        recommendation.player.injuryStatus shouldBe players[index].injuryStatus
+                    }
+                    
+                    // Verify that healthy players are generally ranked higher than injured players
+                    // when projected points are similar
+                    val healthyPlayers = recommendations.filter { it.injuryImpact == InjuryImpact.NONE }
+                    val injuredPlayers = recommendations.filter { it.injuryImpact != InjuryImpact.NONE }
+                    
+                    if (healthyPlayers.isNotEmpty() && injuredPlayers.isNotEmpty()) {
+                        // Among players with similar projected points (within 2 points), 
+                        // healthy players should be ranked higher
+                        val similarPointsThreshold = 2.0
+                        
+                        healthyPlayers.forEach { healthyPlayer ->
+                            injuredPlayers.forEach { injuredPlayer ->
+                                val pointsDifference = kotlin.math.abs(healthyPlayer.projectedPoints - injuredPlayer.projectedPoints)
+                                
+                                if (pointsDifference <= similarPointsThreshold) {
+                                    // When points are similar, healthy player should be ranked higher (lower rank number)
+                                    if (injuredPlayer.injuryImpact == InjuryImpact.OUT) {
+                                        // OUT players should definitely be ranked lower
+                                        healthyPlayer.rank shouldBe kotlin.comparisons.minOf(healthyPlayer.rank, injuredPlayer.rank)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+})
+
+private fun playerWithInjuryGenerator() = arbitrary { rs ->
+    val numPlayers = Arb.int(2, 6).next(rs) // Generate 2-6 players for comparison
+    
+    val injuryStatuses = listOf(
+        null, // Healthy
+        "healthy",
+        "",
+        "questionable",
+        "probable", 
+        "doubtful",
+        "out",
+        "injured reserve",
+        "ir"
+    )
+    
+    val players = (1..numPlayers).map { index ->
+        val playerId = "player_${index}_${Arb.string(3..5).next(rs)}"
+        val injuryStatus = Arb.element(injuryStatuses).next(rs)
+        
+        Player(
+            playerId = playerId,
+            name = "Player $index",
+            position = Arb.element("QB", "RB", "WR", "TE").next(rs),
+            team = Arb.element("DAL", "NYG", "PHI", "WAS", "GB", "MIN").next(rs),
+            injuryStatus = injuryStatus,
+            isActive = injuryStatus != "out" && injuryStatus != "injured reserve" && injuryStatus != "ir",
+            lastUpdated = System.currentTimeMillis()
+        )
+    }
+    
+    val expectedInjuryImpacts = players.map { player ->
+        when (player.injuryStatus?.lowercase()) {
+            null, "healthy", "" -> InjuryImpact.NONE
+            "questionable", "probable" -> InjuryImpact.MINOR
+            "doubtful" -> InjuryImpact.MODERATE
+            "out", "injured reserve", "ir" -> InjuryImpact.OUT
+            else -> InjuryImpact.MINOR
+        }
+    }
+    
+    Pair(players, expectedInjuryImpacts)
+}
+
+private fun generateSeasonStats(playerId: String): List<PlayerStats> {
+    return (1..10).map { week ->
+        val calendar = Calendar.getInstance()
+        calendar.set(2024, Calendar.SEPTEMBER, week * 7)
+        
+        PlayerStats(
+            id = "${playerId}_2024_${week}",
+            playerId = playerId,
+            season = 2024,
+            week = week,
+            fantasyPoints = kotlin.random.Random.nextDouble(10.0, 25.0),
+            rushingYards = kotlin.random.Random.nextInt(0, 151),
+            passingYards = kotlin.random.Random.nextInt(0, 351),
+            receivingYards = kotlin.random.Random.nextInt(0, 121),
+            touchdowns = kotlin.random.Random.nextInt(0, 4),
+            gameDate = calendar.timeInMillis
+        )
+    }
+}
